@@ -25,7 +25,8 @@ SECRET_KEY = 'django-insecure-6+-6^g!($f^8r+9ow_qcdqd30*nzbs16p^6sr)*1pu=(&9!u_c
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+# Hôtes autorisés en développement : ajouter ici le domaine de production.
+ALLOWED_HOSTS = ['localhost', '127.0.0.1', '192.168.1.5']
 
 
 # Application definition
@@ -37,10 +38,9 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-     # Ajoutez ces deux lignes :
+    # API REST, application métier et autorisation CORS pour le futur front.
     'rest_framework',
     'parc',
-    #Ajouter cette  ligne pour activer cors
     'corsheaders',
 ]
 
@@ -52,6 +52,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # Le middleware CORS doit rester présent pour les appels depuis le front.
     'corsheaders.middleware.CorsMiddleware',
 ]
 
@@ -136,10 +137,12 @@ from datetime import timedelta
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'parc.authentication.DBeaverJWTAuthentication',
-    )
+    ),
+    # La vue d'historique utilise ?format=excel pour générer son export.
+    'URL_FORMAT_OVERRIDE': None,
 }
 
-# Configuration de la durée de vie du Token (Optionnel mais recommandé)
+# Durée des JWT fournis par /api/login/.
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(days=1), # Le token reste valide 1 jour
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
@@ -148,7 +151,12 @@ SIMPLE_JWT = {
 
 AUTH_USER_MODEL = "parc.Utilisateur"
 PASSWORD_HASHERS = [
-    'django.contrib.auth.hashers.MD5PasswordHasher', # Permet de tester simplement
+    # MD5 accélère les tests locaux; le remplacer par PBKDF2/Argon2 en production.
+    'django.contrib.auth.hashers.MD5PasswordHasher',
 ]
 
+# Ouvert pendant le développement front; limiter aux domaines du front en production.
 CORS_ALLOW_ALL_ORIGINS = True
+
+# Adresse accessible par les téléphones pour ouvrir une fiche après scan du QR code.
+QR_SCAN_BASE_URL = "http://192.168.1.5:8000"

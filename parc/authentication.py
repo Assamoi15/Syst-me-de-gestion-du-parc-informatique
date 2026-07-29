@@ -1,17 +1,25 @@
+"""Adaptateur JWT pour les tables utilisateurs existantes du projet.
+
+Les vues lisent principalement les claims ``matricule`` et ``role`` insérés
+lors de la connexion. Cet adaptateur évite à DRF de rechercher automatiquement
+un utilisateur Django dans une table différente de la table métier UTILISATEUR.
+"""
+
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.contrib.auth.models import AnonymousUser
 
 class DBeaverJWTAuthentication(JWTAuthentication):
+    """Expose un utilisateur léger construit à partir des claims du JWT."""
     def get_user(self, validated_token):
-        # 1. On crée un utilisateur virtuel à la volée basé sur le contenu chiffré du Token
+        # Utilisateur non persisté : son identité vient uniquement du JWT validé.
         user = AnonymousUser()
         
-        # 2. On lui injecte directement son matricule et son rôle extraits du Token JWT
+        # Ces attributs sont utilisés par les vues pour appliquer les rôles.
         user.matricule = validated_token.get("matricule", "INCONNU")
         user.role = validated_token.get("role", "AGENT_BENEFICIAIRE")
         
-        # On force cet utilisateur virtuel à être considéré comme connecté par l'API
+        # DRF doit le considérer comme authentifié après validation du token.
         user.is_authenticated = True
         
-        # De cette façon, Django n'exécute AUCUNE requête SQL automatique sur sa table fictive
+        # Aucune requête automatique vers une table utilisateur Django n'est nécessaire.
         return user

@@ -1,13 +1,52 @@
+import base64
+from io import BytesIO
+from urllib.parse import quote
+
+import qrcode
+from django.conf import settings
+from django.http import HttpResponse
+from django.utils.html import escape
+"""Vues HTTP de l'API du parc informatique.
+
+Le projet utilise volontairement des requêtes SQL explicites sur les tables
+MySQL existantes (EQUIPEMENT, AFFECTATION, MAINTENANCE, etc.). Les vues lisent
+le JWT Bearer pour appliquer les rôles métier. Les routes sont déclarées dans
+``config/urls.py``; conserver le slash final dans les appels du front.
+
+Le scan QR reste public afin qu'un téléphone puisse consulter une fiche après
+lecture de l'étiquette. Toutes les opérations de gestion restent protégées par
+un rôle dans le jeton.
+"""
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from django.db import connection
+from django.db import connection, transaction
 from rest_framework_simplejwt.tokens import AccessToken
+
+ROLES_UTILISATEUR = {
+    'AGENT_BENEFICIAIRE',
+    'RESPONSABLE_PARC',
+    'DIRECTEUR',
+    'ADMINISTRATEUR',
+}
+
+
+def enregistrer_audit_compte(request, action, description):
+    """Enregistre les actions d'administration des comptes dans HISTORIQUE."""
+    token = AccessToken(request.headers['Authorization'].split(' ', 1)[1])
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO HISTORIQUE (date_action, action, description, utilisateur, id_equipement) "
+            "VALUES (CURDATE(), %s, %s, %s, NULL)",
+            [action, description, token.get('matricule')],
+        )
 
 # ==========================================
 # 1. VUE DE CONNEXION (LOGIN)
 # ==========================================
 class LoginView(APIView):
+    """Authentifie un utilisateur et retourne un JWT contenant son rôle et matricule."""
     authentication_classes = [] 
     permission_classes = []     
 
@@ -20,14 +59,16 @@ class LoginView(APIView):
         
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT matricule, nom, prenom, role, mot_de_passe FROM UTILISATEUR WHERE matricule = %s", 
+                "SELECT matricule, nom, prenom, role, mot_de_passe, is_active FROM UTILISATEUR WHERE matricule = %s", 
                 [matricule_saisi]
             )
             row = cursor.fetchone()
             
         if row:
-            db_matricule, db_nom, db_prenom, db_role, db_mdp = row
+            db_matricule, db_nom, db_prenom, db_role, db_mdp, is_active = row
             if db_mdp == mdp_saisi:
+                if not is_active:
+                    return Response({"error": "Ce compte est désactivé."}, status=status.HTTP_403_FORBIDDEN)
                 # Injection explicite du matricule et du rôle dans le Token
                 token = AccessToken()
                 token['matricule'] = db_matricule
@@ -49,6 +90,7 @@ class LoginView(APIView):
 # 2. GESTION DES UTILISATEURS (RÉSERVÉ ADMIN)
 # ==========================================
 class AdminUserManagementView(APIView):
+    """CRUD des comptes utilisateurs, réservé au rôle ADMINISTRATEUR."""
     authentication_classes = [] 
     permission_classes = []     
 
@@ -60,7 +102,14 @@ class AdminUserManagementView(APIView):
         try:
             token_str = auth_header.split(' ')[1]
             token = AccessToken(token_str)
-            return token.get('role') == 'ADMINISTRATEUR'
+            if token.get('role') != 'ADMINISTRATEUR':
+                return False
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM UTILISATEUR WHERE matricule = %s AND is_active = 1",
+                    [token.get('matricule')],
+                )
+                return cursor.fetchone() is not None
         except Exception:
             return False
 
@@ -79,43 +128,99 @@ class AdminUserManagementView(APIView):
 
         if not all([matricule, nom, prenom, mot_de_passe]):
             return Response({"error": "Champs obligatoires manquants"}, status=status.HTTP_400_BAD_REQUEST)
+        if role not in ROLES_UTILISATEUR:
+            return Response(
+                {"error": "Rôle invalide", "roles_autorises": sorted(ROLES_UTILISATEUR)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO UTILISATEUR (matricule, nom, prenom, mot_de_passe, telephone, date_creation, role) "
-                    "VALUES (%s, %s, %s, %s, %s, CURDATE(), %s)",
-                    [matricule, nom, prenom, mot_de_passe, telephone, role]
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO UTILISATEUR (matricule, nom, prenom, mot_de_passe, telephone, date_creation, role) "
+                        "VALUES (%s, %s, %s, %s, %s, CURDATE(), %s)",
+                        [matricule, nom, prenom, mot_de_passe, telephone, role]
+                    )
+                enregistrer_audit_compte(
+                    request,
+                    "CREATION_COMPTE",
+                    f"Création de l'utilisateur {matricule}",
                 )
             return Response({"message": "Utilisateur créé avec succès !"}, status=status.HTTP_201_CREATED)
         except Exception as e:
             return Response({"error": f"Erreur SQL : {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
     # B. MODIFIER UN UTILISATEUR (PUT)
-    def put(self, request, matricule):
+    def put(self, request, matricule):  # <-- Le nom 'matricule' doit être identique à celui de l'urls.py
         if not self.verifier_si_admin(request):
             return Response({"error": "Accès refusé. Seul l'ADMINISTRATEUR peut modifier un compte."}, status=status.HTTP_403_FORBIDDEN)
-        
+
         data = request.data
+        if 'role' in data and data['role'] not in ROLES_UTILISATEUR:
+            return Response(
+                {"error": "Rôle invalide", "roles_autorises": sorted(ROLES_UTILISATEUR)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if 'mot_de_passe' in data and not data['mot_de_passe']:
+            return Response(
+                {"error": "Le mot de passe ne peut pas être vide."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         try:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE UTILISATEUR SET nom=%s, prenom=%s, telephone=%s, role=%s WHERE matricule=%s",
-                    [data.get('nom'), data.get('prenom'), data.get('telephone'), data.get('role'), matricule]
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT nom, prenom, telephone, role, mot_de_passe FROM UTILISATEUR WHERE matricule = %s",
+                        [matricule]
+                    )
+                    utilisateur = cursor.fetchone()
+                    if not utilisateur:
+                        return Response({"error": "Utilisateur introuvable"}, status=status.HTTP_404_NOT_FOUND)
+                    cursor.execute(
+                        "UPDATE UTILISATEUR SET nom=%s, prenom=%s, telephone=%s, role=%s, mot_de_passe=%s WHERE matricule=%s",
+                        [
+                            data.get('nom', utilisateur[0]),
+                            data.get('prenom', utilisateur[1]),
+                            data.get('telephone', utilisateur[2]),
+                            data.get('role', utilisateur[3]),
+                            data.get('mot_de_passe', utilisateur[4]),
+                            matricule,
+                        ]
+                    )
+                enregistrer_audit_compte(
+                    request,
+                    "MODIFICATION_COMPTE",
+                    f"Modification de l'utilisateur {matricule}",
                 )
             return Response({"message": "Utilisateur mis à jour avec succès !"}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": f"Erreur SQL : {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
-    # C. SUPPRIMER UN UTILISATEUR (DELETE)
+    # C. DÉSACTIVER UN UTILISATEUR (DELETE logique)
     def delete(self, request, matricule):
         if not self.verifier_si_admin(request):
             return Response({"error": "Accès refusé. Seul l'ADMINISTRATEUR peut supprimer un compte."}, status=status.HTTP_403_FORBIDDEN)
         
         try:
-            with connection.cursor() as cursor:
-                cursor.execute("DELETE FROM UTILISATEUR WHERE matricule = %s", [matricule])
-            return Response({"message": "Utilisateur supprimé de la base de données !"}, status=status.HTTP_200_OK)
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE UTILISATEUR SET is_active = 0 WHERE matricule = %s AND is_active = 1",
+                        [matricule],
+                    )
+                    if cursor.rowcount == 0:
+                        cursor.execute("SELECT is_active FROM UTILISATEUR WHERE matricule = %s", [matricule])
+                        utilisateur = cursor.fetchone()
+                        if not utilisateur:
+                            return Response({"error": "Utilisateur introuvable"}, status=status.HTTP_404_NOT_FOUND)
+                        return Response({"message": "Ce compte est déjà désactivé."}, status=status.HTTP_200_OK)
+                enregistrer_audit_compte(
+                    request,
+                    "DESACTIVATION_COMPTE",
+                    f"Désactivation de l'utilisateur {matricule}",
+                )
+            return Response({"message": "Compte désactivé avec succès."}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": f"Erreur SQL : {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -126,6 +231,11 @@ class AdminUserManagementView(APIView):
 # 5. GESTION DE L'INVENTAIRE (CONFORME DIAGRAMME)
 # ==========================================
 class ResponsableInventaireView(APIView):
+    """Liste, crée et modifie les équipements du parc pour RESPONSABLE_PARC.
+
+    ``?format=excel`` produit un fichier XLSX; les filtres ``etat`` et
+    ``marque`` s'appliquent à la liste et à son export.
+    """
     authentication_classes = []
     permission_classes = []
 
@@ -182,6 +292,44 @@ class ResponsableInventaireView(APIView):
             rows = cursor.fetchall()
             
             equipements = [{"id": r[0], "code_inventaire": r[1], "designation": r[2], "marque": r[3], "modele": r[4], "etat": r[5], "description": r[6]} for r in rows]
+
+            if request.GET.get('format', '').lower() in ('excel', 'xlsx'):
+                workbook = Workbook()
+                feuille = workbook.active
+                feuille.title = 'Équipements'
+                feuille.append([
+                    'ID', 'Code inventaire', 'Désignation', 'Marque',
+                    'Modèle', 'État', 'Description'
+                ])
+
+                for cellule in feuille[1]:
+                    cellule.font = Font(bold=True)
+
+                for equipement in equipements:
+                    feuille.append([
+                        equipement['id'], equipement['code_inventaire'],
+                        equipement['designation'], equipement['marque'],
+                        equipement['modele'], equipement['etat'],
+                        equipement['description']
+                    ])
+
+                feuille.freeze_panes = 'A2'
+                for colonne, largeur in {
+                    'A': 10, 'B': 22, 'C': 30, 'D': 20,
+                    'E': 25, 'F': 20, 'G': 45
+                }.items():
+                    feuille.column_dimensions[colonne].width = largeur
+
+                fichier = BytesIO()
+                workbook.save(fichier)
+                fichier.seek(0)
+                response = HttpResponse(
+                    fichier.getvalue(),
+                    content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+                response['Content-Disposition'] = 'attachment; filename="liste_equipements.xlsx"'
+                return response
+
             return Response(equipements, status=status.HTTP_200_OK)
 
     # [FONCTIONNALITÉ : AJOUTER UN ÉQUIPEMENT avec gestion d'erreur doublon]
@@ -200,6 +348,8 @@ class ResponsableInventaireView(APIView):
         if not code or not designation:
             return Response({"error": "Le code inventaire (N° série) et la désignation sont requis"}, status=status.HTTP_400_BAD_REQUEST)
 
+        qr_code = f"QR_{code}"
+
         with connection.cursor() as cursor:
             # ÉTAPE INTERMÉDIAIRE DU DIAGRAMME : Vérifier si le numéro de série existe déjà
             cursor.execute("SELECT id_equipement FROM EQUIPEMENT WHERE code_inventaire = %s", [code])
@@ -210,11 +360,17 @@ class ResponsableInventaireView(APIView):
             try:
                 # Branche [N° série unique] -> INSERT équipement
                 cursor.execute(
-                    "INSERT INTO EQUIPEMENT (code_inventaire, designation, marque, modele, date_acquisition, etat, description) "
-                    "VALUES (%s, %s, %s, %s, CURDATE(), %s, %s)",
-                    [code, designation, marque, modele, etat, desc]
+                    "INSERT INTO EQUIPEMENT (code_inventaire, designation, marque, modele, date_acquisition, etat, description, qr_code) "
+                    "VALUES (%s, %s, %s, %s, CURDATE(), %s, %s, %s)",
+                    [code, designation, marque, modele, etat, desc, qr_code]
                 )
-                return Response({"message": "Confirmation ajout : Équipement inséré avec succès !"}, status=status.HTTP_201_CREATED)
+                id_equipement = cursor.lastrowid
+                return Response({
+                    "message": "Équipement ajouté et QR code généré avec succès !",
+                    "id_equipement": id_equipement,
+                    "qr_code": qr_code,
+                    "etiquette_url": f"/api/parc/equipements/{id_equipement}/etiquette/"
+                }, status=status.HTTP_201_CREATED)
             except Exception as e:
                 return Response({"error": f"Erreur SQL inattendue : {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -237,10 +393,83 @@ class ResponsableInventaireView(APIView):
         except Exception as e:
             return Response({"error": f"Erreur SQL : {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
+class EtiquetteEquipementView(APIView):
+    """Génère une étiquette HTML imprimable avec un QR ouvrant l'API de scan.
+
+    L'adresse encodée provient de ``settings.QR_SCAN_BASE_URL``. La modifier
+    lors d'un changement d'IP locale ou du passage en production.
+    """
+    authentication_classes = []
+    permission_classes = []
+
+    def verifier_responsable_parc(self, request):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return False
+        try:
+            token = AccessToken(auth_header.split(' ')[1])
+            return token.get('role') == 'RESPONSABLE_PARC'
+        except Exception:
+            return False
+
+    def get(self, request, id_equipement):
+        if not self.verifier_responsable_parc(request):
+            return Response({"error": "Accès réservé au RESPONSABLE_PARC"}, status=status.HTTP_403_FORBIDDEN)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT code_inventaire, designation, marque, modele, qr_code "
+                "FROM EQUIPEMENT WHERE id_equipement = %s",
+                [id_equipement]
+            )
+            equipement = cursor.fetchone()
+
+        if not equipement:
+            return Response({"error": "Équipement introuvable"}, status=status.HTTP_404_NOT_FOUND)
+
+        code, designation, marque, modele, qr_code = equipement
+        qr_code = qr_code or f"QR_{code}"
+        base_url = settings.QR_SCAN_BASE_URL.rstrip('/')
+        url_scan = f"{base_url}/api/equipements/scan/?qr_code={quote(str(qr_code), safe='')}"
+        image_qr = qrcode.make(url_scan)
+        image_buffer = BytesIO()
+        image_qr.save(image_buffer, format='PNG')
+        qr_base64 = base64.b64encode(image_buffer.getvalue()).decode('ascii')
+
+        contenu = f"""<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <title>Étiquette {escape(str(code))}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; }}
+    .etiquette {{ width: 320px; border: 2px solid #111; padding: 16px; text-align: center; }}
+    .etiquette img {{ width: 190px; height: 190px; }}
+    .code {{ font-weight: bold; font-size: 20px; }}
+    .designation {{ margin: 8px 0; font-size: 16px; }}
+    .details {{ font-size: 13px; color: #333; }}
+    @media print {{ button {{ display: none; }} body {{ margin: 0; }} }}
+  </style>
+</head>
+<body>
+  <button onclick="window.print()">Imprimer l'étiquette</button>
+  <section class="etiquette">
+    <div class="code">{escape(str(code))}</div>
+    <div class="designation">{escape(str(designation))}</div>
+    <img src="data:image/png;base64,{qr_base64}" alt="QR code {escape(str(qr_code))}">
+    <div class="details">{escape(str(marque or ''))} {escape(str(modele or ''))}</div>
+    <div class="details">QR : {escape(str(qr_code))}</div>
+  </section>
+</body>
+</html>"""
+        return HttpResponse(contenu, content_type='text/html; charset=utf-8')
+
+
 # ==========================================
 # 7. AFFECTATION D'ÉQUIPEMENT (CORRIGÉ DÉFINITIF)
 # ==========================================
 class ResponsableAffectationView(APIView):
+    """Affecte un équipement disponible à un agent et liste les affectations."""
     authentication_classes = []
     permission_classes = []
 
@@ -331,6 +560,7 @@ class ResponsableAffectationView(APIView):
 # 8. DÉSAFFECTATION D'ÉQUIPEMENT (DIAGRAMME 8.8)
 # ==========================================
 class ResponsableDesaffectationView(APIView):
+    """Liste les équipements affectés et termine une affectation en cours."""
     authentication_classes = []
     permission_classes = []
 
@@ -410,6 +640,7 @@ class ResponsableDesaffectationView(APIView):
 # 9. TRAITEMENT DES DEMANDES (DIAGRAMME 8.10)
 # ==========================================
 class ResponsableTraiterDemandeView(APIView):
+    """Permet au responsable de valider ou refuser les demandes des agents."""
     authentication_classes = []
     permission_classes = []
 
@@ -541,6 +772,7 @@ class ResponsableTraiterDemandeView(APIView):
 # 10. DEMANDE D'ACQUISITION (DIAGRAMME 8.9)
 # ==========================================
 class ResponsableDemandeAcquisitionView(APIView):
+    """Crée une demande d'acquisition lorsque le parc ne peut pas répondre au besoin."""
     authentication_classes = []
     permission_classes = []
 
@@ -595,6 +827,7 @@ class ResponsableDemandeAcquisitionView(APIView):
 # 11. TABLEAU DE SUIVI DES ÉQUIPEMENTS (DIAGRAMME 8.12)
 # ==========================================
 class ResponsableSuiviEquipementsView(APIView):
+    """Fournit la vue de suivi globale ou la fiche détaillée d'un équipement."""
     authentication_classes = []
     permission_classes = []
 
@@ -676,6 +909,11 @@ class ResponsableSuiviEquipementsView(APIView):
 # 12. GESTION DES PANNES & MAINTENANCES (DIAGRAMME 8.11)
 # ==========================================
 class ResponsableMaintenanceView(APIView):
+    """Gère les pannes et leur cycle de maintenance.
+
+    Le POST attend ``action``: PLANIFIER, CLOTURER ou HORS_SERVICE. Lors de la
+    planification, le matricule du responsable est mémorisé comme intervenant.
+    """
     authentication_classes = []
     permission_classes = []
 
@@ -693,6 +931,13 @@ class ResponsableMaintenanceView(APIView):
             return token.get('role') == 'RESPONSABLE_PARC'
         except Exception:
             return False
+
+    def obtenir_matricule_intervenant(self, request):
+        """Retourne le matricule du responsable qui enregistre l'intervention."""
+        try:
+            return AccessToken(request.headers.get('Authorization').split(' ')[1]).get('matricule')
+        except Exception:
+            return None
 
     # [ACTION 1 : getListePannes()]
     def get(self, request):
@@ -724,6 +969,7 @@ class ResponsableMaintenanceView(APIView):
             return Response({"error": "Accès réservé au RESPONSABLE_PARC"}, status=status.HTTP_403_FORBIDDEN)
         
         action = request.data.get('action') # 'PLANIFIER', 'CLOTURER', 'HORS_SERVICE'
+        matricule_intervenant = self.obtenir_matricule_intervenant(request)
         
         try:
             with connection.cursor() as cursor:
@@ -749,9 +995,9 @@ class ResponsableMaintenanceView(APIView):
                     
                     # 2. INSERT intervention (table MAINTENANCE)
                     cursor.execute(
-                        "INSERT INTO MAINTENANCE (date_maintenance, type_maintenance, description, resultat, cout, id_equipement) "
-                        "VALUES (CURDATE(), %s, %s, 'EN_COURS', 0.0, %s)",
-                        [type_maint, desc_maint, id_equipement]
+                        "INSERT INTO MAINTENANCE (date_maintenance, type_maintenance, description, resultat, cout, id_equipement, matricule_intervenant) "
+                        "VALUES (CURDATE(), %s, %s, 'EN_COURS', 0.0, %s, %s)",
+                        [type_maint, desc_maint, id_equipement, matricule_intervenant]
                     )
                     id_maintenance = cursor.lastrowid
                     
@@ -813,6 +1059,11 @@ class ResponsableMaintenanceView(APIView):
 # 13. FICHE ÉQUIPEMENT ET SCAN QR (CORRIGÉ INTELLIGENT)
 # ==========================================
 class EquipementFicheScanView(APIView):
+    """Retourne la fiche publique demandée après lecture d'un QR code.
+
+    Accepte ``qr_code`` (cas normal) ou ``code_inventaire`` (saisie manuelle).
+    Cette vue ne demande pas de JWT pour fonctionner depuis un téléphone.
+    """
     authentication_classes = []
     permission_classes = []
 
@@ -845,10 +1096,24 @@ class EquipementFicheScanView(APIView):
             
             id_equip, code, desig, marque, modele, etat, qr, desc = equipement
 
+            cursor.execute(
+                "SELECT a.matricule_agent, u.nom, u.prenom "
+                "FROM AFFECTATION a "
+                "LEFT JOIN UTILISATEUR u ON u.matricule = a.matricule_agent "
+                "WHERE a.id_equipement = %s AND a.date_restitution IS NULL "
+                "ORDER BY a.date_affectation DESC LIMIT 1",
+                [id_equip]
+            )
+            affectation = cursor.fetchone()
+            matricule_agent, nom_agent, prenom_agent = affectation if affectation else (None, None, None)
+
             # 3. Récupération conjointe de l'historique de maintenance
             cursor.execute(
-                "SELECT id_maintenance, date_maintenance, type_maintenance, description, resultat, cout "
-                "FROM MAINTENANCE WHERE id_equipement = %s ORDER BY date_maintenance DESC", [id_equip]
+                "SELECT m.id_maintenance, m.date_maintenance, m.type_maintenance, m.description, m.resultat, m.cout, "
+                "m.matricule_intervenant, u.nom, u.prenom "
+                "FROM MAINTENANCE m "
+                "LEFT JOIN UTILISATEUR u ON u.matricule = m.matricule_intervenant "
+                "WHERE m.id_equipement = %s ORDER BY m.date_maintenance DESC", [id_equip]
             )
             maintenances_rows = cursor.fetchall()
             
@@ -859,7 +1124,10 @@ class EquipementFicheScanView(APIView):
                     "type": m[2],
                     "description": m[3],
                     "resultat": m[4],
-                    "cout": float(m[5])
+                    "cout": float(m[5]),
+                    "matricule_intervenant": m[6],
+                    "nom_intervenant": m[7],
+                    "prenom_intervenant": m[8]
                 } for m in maintenances_rows
             ]
 
@@ -872,7 +1140,10 @@ class EquipementFicheScanView(APIView):
                 "modele": modele,
                 "etat": etat,
                 "qr_code": qr,
-                "description": desc
+                "description": desc,
+                "matricule_agent": matricule_agent,
+                "nom_agent": nom_agent,
+                "prenom_agent": prenom_agent
             },
             "historique_maintenance": historique_maintenance
         }, status=status.HTTP_200_OK)
@@ -880,6 +1151,7 @@ class EquipementFicheScanView(APIView):
 # 14. DEMANDE D'ÉQUIPEMENT (DIAGRAMME 8.1)
 # ==========================================
 class AgentDemandeEquipementView(APIView):
+    """Permet à un utilisateur connecté de soumettre une demande d'équipement."""
     authentication_classes = []
     permission_classes = []
 
@@ -940,6 +1212,7 @@ class AgentDemandeEquipementView(APIView):
 # 15. SUIVI DES DEMANDES AGENT (DIAGRAMME 8.2)
 # ==========================================
 class AgentSuiviDemandesView(APIView):
+    """Liste les demandes de l'agent connecté ou le détail de l'une d'elles."""
     authentication_classes = []
     permission_classes = []
 
@@ -1010,6 +1283,7 @@ class AgentSuiviDemandesView(APIView):
 # 16. SIGNALEMENT DE PANNE (DIAGRAMME 8.4)
 # ==========================================
 class AgentSignalerPanneView(APIView):
+    """Enregistre une panne signalée par l'agent connecté."""
     authentication_classes = []
     permission_classes = []
 
@@ -1068,6 +1342,7 @@ class AgentSignalerPanneView(APIView):
 # 17. HISTORIQUE PERSONNEL AGENT (DIAGRAMME 8.3)
 # ==========================================
 class AgentHistoriquePersonnelView(APIView):
+    """Retourne les demandes et les équipements actuellement affectés à l'agent."""
     authentication_classes = []
     permission_classes = []
 
@@ -1134,6 +1409,7 @@ class AgentHistoriquePersonnelView(APIView):
 # 18. VALIDATION DES ACQUISITIONS (CORRECTION ID_ACQUISITION)
 # ==========================================
 class DirecteurAcquisitionView(APIView):
+    """Liste et traite les demandes d'acquisition du directeur."""
     authentication_classes = []
     permission_classes = []
 
@@ -1220,6 +1496,7 @@ class DirecteurAcquisitionView(APIView):
 # 19. TABLEAU DE BORD ET STATISTIQUES (DIAGRAMME 8.15)
 # ==========================================
 class DirecteurDashboardView(APIView):
+    """Calcule les indicateurs du tableau de bord directeur."""
     authentication_classes = []
     permission_classes = []
 
@@ -1298,18 +1575,19 @@ class DirecteurDashboardView(APIView):
 
         except Exception as e:
             return Response({"error": f"Erreur SQL Statistiques : {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-import csv
-from django.http import HttpResponse
+from openpyxl import Workbook
+from openpyxl.styles import Font
 
 # ==========================================
 # 20. HISTORIQUE GLOBAL DU MATÉRIEL (RESPONSABLE & DIRECTEUR)
 # ==========================================
 class HistoriqueGlobalView(APIView):
+    """Agrège affectations et maintenances; ``?format=excel`` exporte un XLSX."""
     authentication_classes = []
     permission_classes = []
 
     def get(self, request):
-        format_export = request.GET.get('format') # Pour le bloc [opt] de l'export CSV
+        format_export = request.GET.get('format')
 
         historique_global = []
 
@@ -1347,15 +1625,33 @@ class HistoriqueGlobalView(APIView):
         # On trie tout l'historique du plus récent au plus ancien
         historique_global.sort(key=lambda x: x['date'], reverse=True)
 
-        # --- BLOC OPT DU SCHÉMA : [Export demandé] (Générer le fichier CSV) ---
-        if format_export and format_export.lower() == 'csv':
-            response = HttpResponse(content_type='text/csv; charset=utf-8')
-            response['Content-Disposition'] = 'attachment; filename="historique_parc_informatique.csv"'
-            
-            writer = csv.writer(response)
-            writer.writerow(['Date', 'Type d action', 'Description']) # En-tête pour Excel
+        # Export Excel de l'historique.
+        if format_export and format_export.lower() in ('excel', 'xlsx'):
+            workbook = Workbook()
+            feuille = workbook.active
+            feuille.title = 'Historique'
+            feuille.append(['Date', 'Type d action', 'Description'])
+
+            for cellule in feuille[1]:
+                cellule.font = Font(bold=True)
+
             for item in historique_global:
-                writer.writerow([item['date'], item['type_action'], item['description']])
+                feuille.append([item['date'], item['type_action'], item['description']])
+
+            feuille.freeze_panes = 'A2'
+            feuille.column_dimensions['A'].width = 15
+            feuille.column_dimensions['B'].width = 30
+            feuille.column_dimensions['C'].width = 80
+
+            fichier = BytesIO()
+            workbook.save(fichier)
+            fichier.seek(0)
+
+            response = HttpResponse(
+                fichier.getvalue(),
+                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+            response['Content-Disposition'] = 'attachment; filename="historique_parc_informatique.xlsx"'
             return response
 
         # --- FLUX STANDARD : Affichage JSON à l'écran ---
@@ -1364,6 +1660,7 @@ class HistoriqueGlobalView(APIView):
 # 21. LE JOURNAL D'AUDIT DE L'ADMINISTRATEUR (DIAGRAMME 8.17)
 # ==========================================
 class AdminJournalAuditView(APIView):
+    """Expose le journal d'audit avec filtres optionnels utilisateur et action."""
     authentication_classes = []
     permission_classes = []
 

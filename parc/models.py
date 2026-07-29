@@ -1,8 +1,15 @@
+"""Modèle Django minimal pour l'authentification.
+
+Les autres entités métier sont manipulées par SQL dans ``parc.views`` car la
+base existante utilise ses propres tables et conventions de nommage.
+"""
+
 from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 
 
 class UtilisateurManager(BaseUserManager):
+    """Crée les comptes Django tout en conservant ``matricule`` comme identifiant."""
     def create_user(self, matricule, nom, prenom, password=None, mot_de_passe=None, **extra_fields):
         if not matricule:
             raise ValueError("Le matricule est obligatoire.")
@@ -29,6 +36,7 @@ class UtilisateurManager(BaseUserManager):
 
 
 class Utilisateur(AbstractBaseUser, PermissionsMixin):
+    """Représentation Django de la table UTILISATEUR et de ses rôles métier."""
     ROLE_CHOICES = [
         ("AGENT_BENEFICIAIRE", "Agent Bénéficiaire"),
         ("RESPONSABLE_PARC", "Responsable Parc"),

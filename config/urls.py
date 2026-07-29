@@ -1,9 +1,17 @@
+"""Table de routage HTTP de l'application.
+
+Toutes les routes API commencent par ``/api/`` et utilisent un slash final.
+Les autorisations sont vérifiées par les vues, car elles portent la logique de
+rôle métier (ADMINISTRATEUR, RESPONSABLE_PARC, DIRECTEUR, AGENT_BENEFICIAIRE).
+"""
+
 from django.contrib import admin
 from django.urls import path
 from parc.views import (
     LoginView, 
     AdminUserManagementView, 
     ResponsableInventaireView, 
+    EtiquetteEquipementView,
     ResponsableAffectationView, 
     ResponsableDesaffectationView, 
     ResponsableTraiterDemandeView, 
@@ -32,8 +40,9 @@ urlpatterns = [
     # ROUTE DU JOURNAL D'AUDIT DE L'ADMINISTRATEUR (DIAGRAMME 8.17)
     path('api/admin/audit-journal/', AdminJournalAuditView.as_view(), name='admin-audit-journal'),
     
-    # Routes Responsable Parc
+    # Routes Responsable Parc : inventaire, affectations, maintenance et suivi.
     path('api/parc/equipements/', ResponsableInventaireView.as_view(), name='parc-equipements'),
+    path('api/parc/equipements/<int:id_equipement>/etiquette/', EtiquetteEquipementView.as_view(), name='parc-equipement-etiquette'),
     path('api/parc/equipements/<int:id_equipement>/', ResponsableInventaireView.as_view(), name='parc-equipement-detail'),
     path('api/parc/affectations/', ResponsableAffectationView.as_view(), name='parc-affectations'),
     path('api/parc/desaffectations/', ResponsableDesaffectationView.as_view(), name='parc-desaffectations'),
@@ -44,17 +53,17 @@ urlpatterns = [
     path('api/parc/maintenances/', ResponsableMaintenanceView.as_view(), name='parc-maintenances'),
     path('api/parc/historique-global/', HistoriqueGlobalView.as_view(), name='historique-global'),
     
-    # Routes Scan & QR Code Universel
+    # Scan public : utilisé par les téléphones après lecture de l'étiquette QR.
     path('api/equipements/scan/', EquipementFicheScanView.as_view(), name='equipement-scan'),
     
-    # Routes de l'Agent Bénéficiaire
+    # Routes de l'Agent Bénéficiaire : demandes, pannes et espace personnel.
     path('api/agent/demandes/', AgentDemandeEquipementView.as_view(), name='agent-creer-demande'),
     path('api/agent/demandes/suivi/', AgentSuiviDemandesView.as_view(), name='agent-suivi-demandes'),
     path('api/agent/demandes/suivi/<int:id_demande>/', AgentSuiviDemandesView.as_view(), name='agent-detail-demande'),
     path('api/agent/pannes/signaler/', AgentSignalerPanneView.as_view(), name='agent-signaler-panne'),
     path('api/agent/espace-personnel/', AgentHistoriquePersonnelView.as_view(), name='agent-espace-personnel'),
     
-    # Routes du Directeur
+    # Routes du Directeur : acquisition et indicateurs de pilotage.
     path('api/directeur/acquisitions/', DirecteurAcquisitionView.as_view(), name='directeur-acquisitions'),
     path('api/directeur/dashboard/', DirecteurDashboardView.as_view(), name='directeur-dashboard'),
 ]
