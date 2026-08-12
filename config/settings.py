@@ -26,7 +26,7 @@ SECRET_KEY = 'django-insecure-6+-6^g!($f^8r+9ow_qcdqd30*nzbs16p^6sr)*1pu=(&9!u_c
 DEBUG = True
 
 # Hôtes autorisés en développement : ajouter ici le domaine de production.
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', '192.168.1.5']
+ALLOWED_HOSTS = ['localhost', '127.0.0.1', '192.168.1.5', '10.1.10.151']
 
 
 # Application definition
@@ -47,13 +47,14 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+
+    'corsheaders.middleware.CorsMiddleware',
+
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    # Le middleware CORS doit rester présent pour les appels depuis le front.
-    'corsheaders.middleware.CorsMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -151,7 +152,9 @@ SIMPLE_JWT = {
 
 AUTH_USER_MODEL = "parc.Utilisateur"
 PASSWORD_HASHERS = [
-    # MD5 accélère les tests locaux; le remplacer par PBKDF2/Argon2 en production.
+    'django.contrib.auth.hashers.BCryptSHA256PasswordHasher',
+    'django.contrib.auth.hashers.PBKDF2PasswordHasher',
+    # MD5 reste en dernier recours uniquement pour compatibilité éventuelle lors des tests.
     'django.contrib.auth.hashers.MD5PasswordHasher',
 ]
 

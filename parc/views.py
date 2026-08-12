@@ -22,6 +22,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from django.db import connection, transaction
+from django.contrib.auth.hashers import make_password, check_password
 from rest_framework_simplejwt.tokens import AccessToken
 
 ROLES_UTILISATEUR = {
@@ -30,6 +31,18 @@ ROLES_UTILISATEUR = {
     'DIRECTEUR',
     'ADMINISTRATEUR',
 }
+
+
+def mot_de_passe_est_hache(mot_de_passe):
+    if not isinstance(mot_de_passe, str) or '$' not in mot_de_passe:
+        return False
+    prefix = mot_de_passe.split('$', 1)[0]
+    return prefix in {
+        'bcrypt_sha256',
+        'bcrypt',
+        'pbkdf2_sha256',
+        'argon2',
+    }
 
 
 def enregistrer_audit_compte(request, action, description):
@@ -66,10 +79,24 @@ class LoginView(APIView):
             
         if row:
             db_matricule, db_nom, db_prenom, db_role, db_mdp, is_active = row
-            if db_mdp == mdp_saisi:
+
+            if mot_de_passe_est_hache(db_mdp):
+                mot_de_passe_valide = check_password(mdp_saisi, db_mdp)
+            else:
+                mot_de_passe_valide = db_mdp == mdp_saisi
+
+            if mot_de_passe_valide:
                 if not is_active:
                     return Response({"error": "Ce compte est désactivé."}, status=status.HTTP_403_FORBIDDEN)
-                # Injection explicite du matricule et du rôle dans le Token
+
+                if not mot_de_passe_est_hache(db_mdp):
+                    hashed = make_password(mdp_saisi)
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "UPDATE UTILISATEUR SET mot_de_passe = %s WHERE matricule = %s",
+                            [hashed, db_matricule]
+                        )
+
                 token = AccessToken()
                 token['matricule'] = db_matricule
                 token['role'] = db_role
@@ -82,7 +109,7 @@ class LoginView(APIView):
                     "role": db_role,
                     "access_token": str(token)
                 }, status=status.HTTP_200_OK)
-                
+
         return Response({"error": "Matricule ou mot de passe incorrect"}, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -134,13 +161,15 @@ class AdminUserManagementView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        mot_de_passe_hache = make_password(mot_de_passe)
+
         try:
             with transaction.atomic():
                 with connection.cursor() as cursor:
                     cursor.execute(
                         "INSERT INTO UTILISATEUR (matricule, nom, prenom, mot_de_passe, telephone, date_creation, role) "
                         "VALUES (%s, %s, %s, %s, %s, CURDATE(), %s)",
-                        [matricule, nom, prenom, mot_de_passe, telephone, role]
+                        [matricule, nom, prenom, mot_de_passe_hache, telephone, role]
                     )
                 enregistrer_audit_compte(
                     request,
@@ -151,7 +180,118 @@ class AdminUserManagementView(APIView):
         except Exception as e:
             return Response({"error": f"Erreur SQL : {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
-    # B. MODIFIER UN UTILISATEUR (PUT)
+    # B. LISTER LES UTILISATEURS (GET)
+    def get(self, request):
+        if not self.verifier_si_admin(request):
+            return Response({"error": "Accès refusé. Seul l'ADMINISTRATEUR peut consulter la liste des utilisateurs."}, status=status.HTTP_403_FORBIDDEN)
+
+        status_filter = request.GET.get('status', 'all').lower()
+        page = request.GET.get('page', '1')
+        page_size = request.GET.get('size', '20')
+        try:
+            page = max(1, int(page))
+        except ValueError:
+            page = 1
+        try:
+            page_size = min(100, max(1, int(page_size)))
+        except ValueError:
+            page_size = 20
+
+        params = []
+        where_clause = ""
+        select_last_login = "NULL AS last_login"
+        select_telephone = "'' AS telephone"
+        select_date_creation = "NULL AS date_creation"
+        supports_last_login = False
+        supports_telephone = False
+        supports_date_creation = False
+
+        with connection.cursor() as cursor:
+            try:
+                cursor.execute("SHOW COLUMNS FROM UTILISATEUR LIKE 'last_login'")
+                supports_last_login = cursor.fetchone() is not None
+            except Exception:
+                supports_last_login = False
+            try:
+                cursor.execute("SHOW COLUMNS FROM UTILISATEUR LIKE 'telephone'")
+                supports_telephone = cursor.fetchone() is not None
+            except Exception:
+                supports_telephone = False
+            try:
+                cursor.execute("SHOW COLUMNS FROM UTILISATEUR LIKE 'date_creation'")
+                supports_date_creation = cursor.fetchone() is not None
+            except Exception:
+                supports_date_creation = False
+
+        if status_filter == 'active':
+            where_clause = "WHERE is_active = 1"
+        elif status_filter == 'inactive':
+            where_clause = "WHERE is_active = 0"
+        elif status_filter == 'jamais_connecte':
+            if supports_last_login:
+                where_clause = "WHERE is_active = 1 AND last_login IS NULL"
+            else:
+                where_clause = "WHERE is_active = 1"
+
+        if supports_last_login:
+            select_last_login = "last_login"
+        if supports_telephone:
+            select_telephone = "telephone"
+        if supports_date_creation:
+            select_date_creation = "date_creation"
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM UTILISATEUR " + where_clause,
+                params,
+            )
+            total_items = cursor.fetchone()[0]
+
+            offset = (page - 1) * page_size
+            cursor.execute(
+                "SELECT matricule, nom, prenom, " + select_telephone + ", role, is_active, 0 AS is_staff, 0 AS is_superuser, "
+                + select_last_login + ", " + select_date_creation + " "
+                "FROM UTILISATEUR " + where_clause + " ORDER BY matricule LIMIT %s OFFSET %s",
+                params + [page_size, offset],
+            )
+            rows = cursor.fetchall()
+
+        utilisateurs = []
+        for row in rows:
+            last_login = row[8]
+            if not row[5]:
+                statut = "inactif"
+            elif last_login is None:
+                statut = "jamais connecté"
+            else:
+                statut = "actif"
+
+            utilisateurs.append({
+                "matricule": row[0],
+                "nom": row[1],
+                "prenom": row[2],
+                "telephone": row[3],
+                "role": row[4],
+                "is_active": bool(row[5]),
+                "is_staff": bool(row[6]),
+                "is_superuser": bool(row[7]),
+                "dernier_login": str(last_login) if last_login is not None else None,
+                "date_creation": str(row[9]) if row[9] is not None else None,
+                "section": None,
+                "status": statut,
+            })
+
+        total_pages = (total_items + page_size - 1) // page_size
+        return Response({
+            "status_filter": status_filter,
+            "page": page,
+            "size": page_size,
+            "total_items": total_items,
+            "total_pages": total_pages,
+            "utilisateurs": utilisateurs,
+        }, status=status.HTTP_200_OK)
+
+    # C. MODIFIER UN UTILISATEUR (PUT)
     def put(self, request, matricule):  # <-- Le nom 'matricule' doit être identique à celui de l'urls.py
         if not self.verifier_si_admin(request):
             return Response({"error": "Accès refusé. Seul l'ADMINISTRATEUR peut modifier un compte."}, status=status.HTTP_403_FORBIDDEN)
@@ -177,6 +317,18 @@ class AdminUserManagementView(APIView):
                     utilisateur = cursor.fetchone()
                     if not utilisateur:
                         return Response({"error": "Utilisateur introuvable"}, status=status.HTTP_404_NOT_FOUND)
+
+                    nouveau_mot_de_passe = utilisateur[4]
+                    if 'mot_de_passe' in data:
+                        if not data['mot_de_passe']:
+                            return Response(
+                                {"error": "Le mot de passe ne peut pas être vide."},
+                                status=status.HTTP_400_BAD_REQUEST,
+                            )
+                        nouveau_mot_de_passe = make_password(data['mot_de_passe'])
+                    elif not mot_de_passe_est_hache(nouveau_mot_de_passe):
+                        nouveau_mot_de_passe = make_password(nouveau_mot_de_passe)
+
                     cursor.execute(
                         "UPDATE UTILISATEUR SET nom=%s, prenom=%s, telephone=%s, role=%s, mot_de_passe=%s WHERE matricule=%s",
                         [
@@ -184,7 +336,7 @@ class AdminUserManagementView(APIView):
                             data.get('prenom', utilisateur[1]),
                             data.get('telephone', utilisateur[2]),
                             data.get('role', utilisateur[3]),
-                            data.get('mot_de_passe', utilisateur[4]),
+                            nouveau_mot_de_passe,
                             matricule,
                         ]
                     )
@@ -194,6 +346,77 @@ class AdminUserManagementView(APIView):
                     f"Modification de l'utilisateur {matricule}",
                 )
             return Response({"message": "Utilisateur mis à jour avec succès !"}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": f"Erreur SQL : {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+    # D. RÉINITIALISER LE MOT DE PASSE D'UN UTILISATEUR (PATCH)
+    def patch(self, request, matricule):
+        if not self.verifier_si_admin(request):
+            return Response({"error": "Accès refusé. Seul l'ADMINISTRATEUR peut réinitialiser un mot de passe."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            data = request.data
+        except Exception:
+            data = None
+
+        if not data:
+            try:
+                import json
+                raw_body = request.body.decode('utf-8')
+                if raw_body:
+                    parsed = json.loads(raw_body)
+                    if isinstance(parsed, dict):
+                        data = parsed
+            except Exception:
+                data = {}
+
+        def extraire_mot_de_passe(mapping):
+            if not mapping:
+                return None
+            accepted_keys = {'mot_de_passe', 'password', 'new_password', 'newpassword', 'nouveau_mot_de_passe'}
+            if isinstance(mapping, dict) or hasattr(mapping, 'items'):
+                for key, value in mapping.items():
+                    if isinstance(key, str) and key.lower() in accepted_keys:
+                        return value
+            return None
+
+        nouveau_mot_de_passe = (
+            extraire_mot_de_passe(data) or
+            request.query_params.get('mot_de_passe') or
+            request.query_params.get('password') or
+            request.query_params.get('new_password') or
+            request.query_params.get('nouveau_mot_de_passe')
+        )
+        if not nouveau_mot_de_passe:
+            return Response(
+                {
+                    "error": "Le nouveau mot de passe est requis.",
+                    "detail": "Envoyez mot_de_passe, password ou new_password dans le corps JSON ou en query string.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT matricule FROM UTILISATEUR WHERE matricule = %s",
+                        [matricule]
+                    )
+                    if cursor.fetchone() is None:
+                        return Response({"error": "Utilisateur introuvable"}, status=status.HTTP_404_NOT_FOUND)
+
+                    mot_de_passe_hache = make_password(nouveau_mot_de_passe)
+                    cursor.execute(
+                        "UPDATE UTILISATEUR SET mot_de_passe = %s WHERE matricule = %s",
+                        [mot_de_passe_hache, matricule]
+                    )
+                enregistrer_audit_compte(
+                    request,
+                    "REINITIALISATION_MOT_DE_PASSE",
+                    f"Réinitialisation du mot de passe de l'utilisateur {matricule}",
+                )
+            return Response({"message": "Mot de passe réinitialisé avec succès."}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": f"Erreur SQL : {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -365,10 +588,20 @@ class ResponsableInventaireView(APIView):
                     [code, designation, marque, modele, etat, desc, qr_code]
                 )
                 id_equipement = cursor.lastrowid
+
+                base_url = settings.QR_SCAN_BASE_URL.rstrip('/')
+                qr_scan_url = f"{base_url}/api/equipements/scan/?qr_code={quote(qr_code, safe='')}"
+                image_qr = qrcode.make(qr_scan_url)
+                image_buffer = BytesIO()
+                image_qr.save(image_buffer, format='PNG')
+                qr_image_base64 = base64.b64encode(image_buffer.getvalue()).decode('ascii')
+
                 return Response({
                     "message": "Équipement ajouté et QR code généré avec succès !",
                     "id_equipement": id_equipement,
                     "qr_code": qr_code,
+                    "qr_scan_url": qr_scan_url,
+                    "qr_image_base64": qr_image_base64,
                     "etiquette_url": f"/api/parc/equipements/{id_equipement}/etiquette/"
                 }, status=status.HTTP_201_CREATED)
             except Exception as e:
