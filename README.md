@@ -1,4 +1,3 @@
-# Syst-me-de-gestion-du-parc-informatique
 # Système de Gestion du Parc Informatique
 
 Ce projet consiste en une application web backend robuste conçue pour la gestion, le suivi et la maintenance du parc informatique d'un cabinet. Elle permet de suivre l'état des équipements, d'assigner le matériel aux collaborateurs et de centraliser les demandes d'assistance ou de maintenance.
