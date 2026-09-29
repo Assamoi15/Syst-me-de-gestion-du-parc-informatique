@@ -1,0 +1,22 @@
+[Unit]
+Description=Parc Informatique Gunicorn daemon (HTTP)
+After=network.target mysql.service
+Requires=mysql.service
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/parc/backend
+Environment="PATH=/var/www/parc/backend/venv/bin"
+Environment="DJANGO_SETTINGS_MODULE=config.settings"
+EnvironmentFile=/var/www/parc/backend/.env
+ExecStart=/var/www/parc/backend/venv/bin/gunicorn \
+    --config /var/www/parc/backend/deploy/gunicorn.conf.py \
+    config.wsgi:application
+ExecReload=/bin/kill -s HUP $MAINPID
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

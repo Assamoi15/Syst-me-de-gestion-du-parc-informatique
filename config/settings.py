@@ -10,23 +10,39 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Charge le fichier .env à la racine du projet (à côté de manage.py).
+# En son absence (poste de dev sans .env), les valeurs par défaut ci-dessous
+# reproduisent l'ancien comportement codé en dur.
+load_dotenv(BASE_DIR / '.env')
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
+
+def _split_env_list(name, default):
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    return [item.strip() for item in raw.split(',') if item.strip()]
+
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-6+-6^g!($f^8r+9ow_qcdqd30*nzbs16p^6sr)*1pu=(&9!u_c'
+SECRET_KEY = os.environ.get(
+    'SECRET_KEY',
+    'django-insecure-6+-6^g!($f^8r+9ow_qcdqd30*nzbs16p^6sr)*1pu=(&9!u_c',
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DEBUG', 'True') == 'True'
 
-# Hôtes autorisés en développement : ajouter ici le domaine de production.
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', '192.168.1.5', '10.1.10.151']
+ALLOWED_HOSTS = _split_env_list(
+    'ALLOWED_HOSTS', ['localhost', '127.0.0.1', '192.168.1.5', '10.1.10.151']
+)
 
 
 # Application definition
@@ -83,11 +99,11 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'gestion_parc_informatique',
-        'USER': 'root',
-        'PASSWORD': '',
-        'HOST': '127.0.0.1',
-        'PORT': '3306',
+        'NAME': os.environ.get('DB_NAME', 'gestion_parc_informatique'),
+        'USER': os.environ.get('DB_USER', 'root'),
+        'PASSWORD': os.environ.get('DB_PASSWORD', ''),
+        'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
+        'PORT': os.environ.get('DB_PORT', '3306'),
         # Ajoutez ce bloc OPTIONS pour désactiver la fonction RETURNING incompatible
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
@@ -132,6 +148,10 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+MEDIA_URL = 'media/'
+MEDIA_ROOT = BASE_DIR / 'media'
 
 from datetime import timedelta
 
@@ -158,8 +178,16 @@ PASSWORD_HASHERS = [
     'django.contrib.auth.hashers.MD5PasswordHasher',
 ]
 
-# Ouvert pendant le développement front; limiter aux domaines du front en production.
-CORS_ALLOW_ALL_ORIGINS = True
+# Ouvert par défaut en développement (pas de CORS_ALLOWED_ORIGINS dans .env);
+# en production, définir CORS_ALLOWED_ORIGINS dans .env pour désactiver ce mode.
+CORS_ALLOW_ALL_ORIGINS = 'CORS_ALLOWED_ORIGINS' not in os.environ
+CORS_ALLOWED_ORIGINS = _split_env_list('CORS_ALLOWED_ORIGINS', [])
 
 # Adresse accessible par les téléphones pour ouvrir une fiche après scan du QR code.
-QR_SCAN_BASE_URL = "http://192.168.1.5:8000"
+QR_SCAN_BASE_URL = os.environ.get('QR_SCAN_BASE_URL', 'http://192.168.1.5:8000')
+
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    CSRF_COOKIE_SECURE = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_TRUSTED_ORIGINS = [f'https://{host}' for host in ALLOWED_HOSTS if host not in ('localhost', '127.0.0.1')]
