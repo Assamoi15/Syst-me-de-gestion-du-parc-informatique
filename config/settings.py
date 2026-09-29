@@ -56,6 +56,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     # API REST, application métier et autorisation CORS pour le futur front.
     'rest_framework',
+    'drf_spectacular',
     'parc',
     'corsheaders',
 ]
@@ -161,6 +162,35 @@ REST_FRAMEWORK = {
     ),
     # La vue d'historique utilise ?format=excel pour générer son export.
     'URL_FORMAT_OVERRIDE': None,
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+# Documentation OpenAPI/Swagger, servie sur /api/docs/ (voir config/urls.py).
+# Les vues décodent le JWT Bearer manuellement (authentication_classes = []),
+# donc le schéma de sécurité est déclaré ici pour que le bouton "Authorize"
+# de Swagger UI fonctionne malgré tout.
+SPECTACULAR_SETTINGS = {
+    'TITLE': "API — Gestion du Parc Informatique",
+    'DESCRIPTION': (
+        "Documentation de l'API du système de gestion du parc informatique "
+        "(inventaire, affectations, maintenance, demandes, acquisitions). "
+        "Toutes les routes protégées attendent un en-tête "
+        "`Authorization: Bearer <access_token>` obtenu via `/api/login/`."
+    ),
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'SCHEMA_PATH_PREFIX': r'/api',
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SECURITY': [{'bearerAuth': []}],
+    'APPEND_COMPONENTS': {
+        'securitySchemes': {
+            'bearerAuth': {
+                'type': 'http',
+                'scheme': 'bearer',
+                'bearerFormat': 'JWT',
+            }
+        }
+    },
 }
 
 # Durée des JWT fournis par /api/login/.

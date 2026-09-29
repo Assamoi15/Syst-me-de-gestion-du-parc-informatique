@@ -24,6 +24,7 @@ from rest_framework import status
 from django.db import connection, transaction
 from django.contrib.auth.hashers import make_password, check_password
 from rest_framework_simplejwt.tokens import AccessToken
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiExample
 
 ROLES_UTILISATEUR = {
     'AGENT_BENEFICIAIRE',
@@ -58,6 +59,23 @@ def enregistrer_audit_compte(request, action, description):
 # ==========================================
 # 1. VUE DE CONNEXION (LOGIN)
 # ==========================================
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Authentification"],
+        summary="Connexion (obtenir un JWT)",
+        description="Vérifie le matricule et le mot de passe, migre les mots de passe en clair vers un hash, "
+                     "et retourne un access_token JWT contenant `matricule` et `role`. Ce token doit être envoyé "
+                     "en en-tête `Authorization: Bearer <token>` sur les autres routes.",
+        examples=[
+            OpenApiExample(
+                "Requête de connexion",
+                value={"matricule": "RP-2026-001", "mot_de_passe": "motdepasse"},
+                request_only=True,
+            ),
+        ],
+        auth=[],
+    ),
+)
 class LoginView(APIView):
     """Authentifie un utilisateur et retourne un JWT contenant son rôle et matricule."""
     authentication_classes = [] 
@@ -116,6 +134,13 @@ class LoginView(APIView):
 # ==========================================
 # 2. GESTION DES UTILISATEURS (RÉSERVÉ ADMIN)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(tags=["Admin - Utilisateurs"], summary="Lister les utilisateurs (paginé, filtrable par statut)"),
+    post=extend_schema(tags=["Admin - Utilisateurs"], summary="Créer un utilisateur"),
+    put=extend_schema(tags=["Admin - Utilisateurs"], summary="Modifier un utilisateur"),
+    patch=extend_schema(tags=["Admin - Utilisateurs"], summary="Réinitialiser le mot de passe d'un utilisateur"),
+    delete=extend_schema(tags=["Admin - Utilisateurs"], summary="Désactiver un utilisateur (suppression logique)"),
+)
 class AdminUserManagementView(APIView):
     """CRUD des comptes utilisateurs, réservé au rôle ADMINISTRATEUR."""
     authentication_classes = [] 
@@ -453,6 +478,16 @@ class AdminUserManagementView(APIView):
 # ==========================================
 # 5. GESTION DE L'INVENTAIRE (CONFORME DIAGRAMME)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Parc - Inventaire"],
+        summary="Lister ou consulter un équipement",
+        description="Sans `id_equipement` dans l'URL: liste filtrable par `?etat=` et `?marque=`, "
+                     "exportable en Excel avec `?format=excel`. Avec `id_equipement`: fiche détaillée.",
+    ),
+    post=extend_schema(tags=["Parc - Inventaire"], summary="Ajouter un équipement (génère le QR code)"),
+    put=extend_schema(tags=["Parc - Inventaire"], summary="Modifier un équipement"),
+)
 class ResponsableInventaireView(APIView):
     """Liste, crée et modifie les équipements du parc pour RESPONSABLE_PARC.
 
@@ -626,6 +661,13 @@ class ResponsableInventaireView(APIView):
         except Exception as e:
             return Response({"error": f"Erreur SQL : {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Parc - Étiquettes"],
+        summary="Générer l'étiquette imprimable d'un équipement",
+        description="Retourne une page HTML avec le QR code encodé vers l'URL de scan publique.",
+    ),
+)
 class EtiquetteEquipementView(APIView):
     """Génère une étiquette HTML imprimable avec un QR ouvrant l'API de scan.
 
@@ -701,6 +743,10 @@ class EtiquetteEquipementView(APIView):
 # ==========================================
 # 7. AFFECTATION D'ÉQUIPEMENT (CORRIGÉ DÉFINITIF)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(tags=["Parc - Affectations"], summary="Lister les équipements disponibles à l'affectation"),
+    post=extend_schema(tags=["Parc - Affectations"], summary="Affecter un équipement à un agent"),
+)
 class ResponsableAffectationView(APIView):
     """Affecte un équipement disponible à un agent et liste les affectations."""
     authentication_classes = []
@@ -792,6 +838,10 @@ class ResponsableAffectationView(APIView):
 # ==========================================
 # 8. DÉSAFFECTATION D'ÉQUIPEMENT (DIAGRAMME 8.8)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(tags=["Parc - Désaffectations"], summary="Lister les équipements actuellement affectés"),
+    post=extend_schema(tags=["Parc - Désaffectations"], summary="Terminer une affectation (retour, panne, etc.)"),
+)
 class ResponsableDesaffectationView(APIView):
     """Liste les équipements affectés et termine une affectation en cours."""
     authentication_classes = []
@@ -872,6 +922,14 @@ class ResponsableDesaffectationView(APIView):
 # ==========================================
 # 9. TRAITEMENT DES DEMANDES (DIAGRAMME 8.10)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(tags=["Parc - Demandes"], summary="Lister les demandes en attente"),
+    post=extend_schema(
+        tags=["Parc - Demandes"],
+        summary="Valider ou refuser une demande d'équipement",
+        description="`action` vaut `VALIDER` ou `REFUSER`. En cas de refus, `motif_rejet` est optionnel.",
+    ),
+)
 class ResponsableTraiterDemandeView(APIView):
     """Permet au responsable de valider ou refuser les demandes des agents."""
     authentication_classes = []
@@ -1004,6 +1062,9 @@ class ResponsableTraiterDemandeView(APIView):
 # ==========================================
 # 10. DEMANDE D'ACQUISITION (DIAGRAMME 8.9)
 # ==========================================
+@extend_schema_view(
+    post=extend_schema(tags=["Parc - Acquisitions"], summary="Soumettre une demande d'acquisition au Directeur"),
+)
 class ResponsableDemandeAcquisitionView(APIView):
     """Crée une demande d'acquisition lorsque le parc ne peut pas répondre au besoin."""
     authentication_classes = []
@@ -1059,6 +1120,13 @@ class ResponsableDemandeAcquisitionView(APIView):
 # ==========================================
 # 11. TABLEAU DE SUIVI DES ÉQUIPEMENTS (DIAGRAMME 8.12)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Parc - Suivi"],
+        summary="Tableau de suivi des équipements, ou fiche détaillée si `id_equipement` est fourni",
+        description="Filtrable par `?etat=` et `?marque=` sur la vue liste.",
+    ),
+)
 class ResponsableSuiviEquipementsView(APIView):
     """Fournit la vue de suivi globale ou la fiche détaillée d'un équipement."""
     authentication_classes = []
@@ -1141,6 +1209,14 @@ class ResponsableSuiviEquipementsView(APIView):
 # ==========================================
 # 12. GESTION DES PANNES & MAINTENANCES (DIAGRAMME 8.11)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(tags=["Parc - Maintenance"], summary="Lister les pannes ouvertes"),
+    post=extend_schema(
+        tags=["Parc - Maintenance"],
+        summary="Planifier, clôturer ou mettre hors service une intervention",
+        description="`action` vaut `PLANIFIER`, `CLOTURER` ou `HORS_SERVICE`.",
+    ),
+)
 class ResponsableMaintenanceView(APIView):
     """Gère les pannes et leur cycle de maintenance.
 
@@ -1291,6 +1367,15 @@ class ResponsableMaintenanceView(APIView):
 # ==========================================
 # 13. FICHE ÉQUIPEMENT ET SCAN QR (CORRIGÉ INTELLIGENT)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Scan public"],
+        summary="Fiche équipement après scan QR (sans JWT)",
+        description="Accepte `?qr_code=` (cas normal) ou `?code_inventaire=` (saisie manuelle). Route publique "
+                     "utilisée depuis un téléphone après lecture de l'étiquette.",
+        auth=[],
+    ),
+)
 class EquipementFicheScanView(APIView):
     """Retourne la fiche publique demandée après lecture d'un QR code.
 
@@ -1383,6 +1468,9 @@ class EquipementFicheScanView(APIView):
 # ==========================================
 # 14. DEMANDE D'ÉQUIPEMENT (DIAGRAMME 8.1)
 # ==========================================
+@extend_schema_view(
+    post=extend_schema(tags=["Agent - Demandes"], summary="Soumettre une demande d'équipement"),
+)
 class AgentDemandeEquipementView(APIView):
     """Permet à un utilisateur connecté de soumettre une demande d'équipement."""
     authentication_classes = []
@@ -1444,6 +1532,12 @@ class AgentDemandeEquipementView(APIView):
 # ==========================================
 # 15. SUIVI DES DEMANDES AGENT (DIAGRAMME 8.2)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Agent - Demandes"],
+        summary="Lister mes demandes, ou le détail d'une demande si `id_demande` est fourni",
+    ),
+)
 class AgentSuiviDemandesView(APIView):
     """Liste les demandes de l'agent connecté ou le détail de l'une d'elles."""
     authentication_classes = []
@@ -1515,6 +1609,9 @@ class AgentSuiviDemandesView(APIView):
 # ==========================================
 # 16. SIGNALEMENT DE PANNE (DIAGRAMME 8.4)
 # ==========================================
+@extend_schema_view(
+    post=extend_schema(tags=["Agent - Pannes"], summary="Signaler une panne sur un équipement affecté"),
+)
 class AgentSignalerPanneView(APIView):
     """Enregistre une panne signalée par l'agent connecté."""
     authentication_classes = []
@@ -1574,6 +1671,12 @@ class AgentSignalerPanneView(APIView):
 # ==========================================
 # 17. HISTORIQUE PERSONNEL AGENT (DIAGRAMME 8.3)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Agent - Espace personnel"],
+        summary="Historique des demandes et équipements affectés à l'agent connecté",
+    ),
+)
 class AgentHistoriquePersonnelView(APIView):
     """Retourne les demandes et les équipements actuellement affectés à l'agent."""
     authentication_classes = []
@@ -1641,6 +1744,10 @@ class AgentHistoriquePersonnelView(APIView):
 # ==========================================
 # 18. VALIDATION DES ACQUISITIONS (CORRECTION ID_ACQUISITION)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(tags=["Directeur - Acquisitions"], summary="Lister les demandes d'acquisition en attente"),
+    post=extend_schema(tags=["Directeur - Acquisitions"], summary="Valider ou refuser une demande d'acquisition"),
+)
 class DirecteurAcquisitionView(APIView):
     """Liste et traite les demandes d'acquisition du directeur."""
     authentication_classes = []
@@ -1728,6 +1835,13 @@ class DirecteurAcquisitionView(APIView):
 # ==========================================
 # 19. TABLEAU DE BORD ET STATISTIQUES (DIAGRAMME 8.15)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Directeur - Dashboard"],
+        summary="Indicateurs clés (équipements, demandes, pannes)",
+        description="Filtrable sur la période avec `?date_debut=YYYY-MM-DD&date_fin=YYYY-MM-DD`.",
+    ),
+)
 class DirecteurDashboardView(APIView):
     """Calcule les indicateurs du tableau de bord directeur."""
     authentication_classes = []
@@ -1814,6 +1928,13 @@ from openpyxl.styles import Font
 # ==========================================
 # 20. HISTORIQUE GLOBAL DU MATÉRIEL (RESPONSABLE & DIRECTEUR)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Historique"],
+        summary="Historique global du matériel (affectations + maintenances)",
+        description="`?format=excel` exporte le résultat en fichier XLSX.",
+    ),
+)
 class HistoriqueGlobalView(APIView):
     """Agrège affectations et maintenances; ``?format=excel`` exporte un XLSX."""
     authentication_classes = []
@@ -1892,6 +2013,13 @@ class HistoriqueGlobalView(APIView):
 # ==========================================
 # 21. LE JOURNAL D'AUDIT DE L'ADMINISTRATEUR (DIAGRAMME 8.17)
 # ==========================================
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Admin - Audit"],
+        summary="Journal d'audit des comptes",
+        description="Filtrable avec `?utilisateur=` et `?action=`.",
+    ),
+)
 class AdminJournalAuditView(APIView):
     """Expose le journal d'audit avec filtres optionnels utilisateur et action."""
     authentication_classes = []
