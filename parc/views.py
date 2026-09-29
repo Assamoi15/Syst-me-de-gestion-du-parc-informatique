@@ -2049,7 +2049,7 @@ class AdminJournalAuditView(APIView):
         filtre_user = request.GET.get('utilisateur')
         filtre_action = request.GET.get('action')
 
-        query = "SELECT id_historique, date_action, action, description, utilisateur FROM historique WHERE 1=1"
+        query = "SELECT id_historique, date_action, action, description, utilisateur FROM HISTORIQUE WHERE 1=1"
         params = []
 
         if filtre_user:
