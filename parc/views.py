@@ -115,6 +115,13 @@ class LoginView(APIView):
                             [hashed, db_matricule]
                         )
 
+                # Alimente le statut "jamais connecté" affiché dans la gestion des comptes.
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE UTILISATEUR SET last_login = NOW() WHERE matricule = %s",
+                        [db_matricule]
+                    )
+
                 token = AccessToken()
                 token['matricule'] = db_matricule
                 token['role'] = db_role
@@ -792,9 +799,7 @@ class ResponsableAffectationView(APIView):
             cursor.execute("SELECT id_equipement, code_inventaire, designation, marque, modele FROM EQUIPEMENT WHERE etat = 'DISPONIBLE'")
             rows = cursor.fetchall()
             
-        if not rows:
-            return Response({"message": "Aucun équipement disponible dans le stock"}, status=status.HTTP_200_OK)
-            
+        # Liste vide (et non un objet) quand le stock est vide : le front attend toujours un tableau.
         equipements = [{"id": r[0], "code_inventaire": r[1], "designation": r[2], "marque": r[3], "modele": r[4]} for r in rows]
         return Response(equipements, status=status.HTTP_200_OK)
 
@@ -873,9 +878,6 @@ class ResponsableDesaffectationView(APIView):
                 "WHERE e.etat = 'AFFECTE' AND a.date_restitution IS NULL"
             )
             rows = cursor.fetchall()
-            
-        if not rows:
-            return Response({"message": "Aucun équipement n'est actuellement affecté"}, status=status.HTTP_200_OK)
             
         equipements = [{"id_equipement": r[0], "code_inventaire": r[1], "designation": r[2], "agent_actuel": r[3]} for r in rows]
         return Response(equipements, status=status.HTTP_200_OK)
@@ -1340,9 +1342,13 @@ class ResponsableMaintenanceView(APIView):
                     # 2. UPDATE PANNE SET statut = RESOLUE
                     cursor.execute("UPDATE PANNE SET statut = 'RESOLUE' WHERE id_maintenance = %s", [id_maintenance])
                     
-                    # 3. UPDATE équipement SET statut = Disponible
+                    # 3. UPDATE équipement : Disponible si réparé, Hors service si irréparable
+                    if str(resultat).upper() == 'NON_REPARABLE':
+                        cursor.execute("UPDATE EQUIPEMENT SET etat = 'HORS_SERVICE' WHERE id_equipement = %s", [id_equipement])
+                        return Response({"message": "Confirmation clôture : Équipement non réparable, mis hors service."}, status=status.HTTP_200_OK)
+
                     cursor.execute("UPDATE EQUIPEMENT SET etat = 'DISPONIBLE' WHERE id_equipement = %s", [id_equipement])
-                    
+
                     return Response({"message": "Confirmation clôture : Équipement réparé et remis en stock !"}, status=status.HTTP_200_OK)
 
                 # --- CAS 3 : mettreHorsService(equipId) [Équipement irréparable] ---
@@ -1756,20 +1762,21 @@ class DirecteurAcquisitionView(APIView):
     def verifier_directeur_et_obtenir_matricule(self, request):
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
-            return "DIR-2026-001"
+            return None
         try:
             parts = auth_header.split(' ')
             if len(parts) == 2:
-                from rest_framework_simplejwt.tokens import AccessToken
                 token = AccessToken(parts[1])
-                return token.get('matricule', 'DIR-2026-001')
+                if token.get('role') == 'DIRECTEUR':
+                    return token.get('matricule')
         except Exception:
             pass
-        return "DIR-2026-001"
+        return None
 
     # [ACTION 1 : getDemandesAcquisition()]
-      # [ACTION 1 : getDemandesAcquisition() CORRIGÉ]
     def get(self, request):
+        if not self.verifier_directeur_et_obtenir_matricule(request):
+            return Response({"error": "Accès réservé au DIRECTEUR"}, status=status.HTTP_403_FORBIDDEN)
         with connection.cursor() as cursor:
             cursor.execute("SELECT * FROM DEMANDE_ACQUISITION WHERE statut = 'EN_ATTENTE'")
             
@@ -1793,6 +1800,8 @@ class DirecteurAcquisitionView(APIView):
     # [ACTION 2 & 3 : validerAcquisition() OU refuserAcquisition()]
     def post(self, request):
         dir_matricule = self.verifier_directeur_et_obtenir_matricule(request)
+        if not dir_matricule:
+            return Response({"error": "Accès réservé au DIRECTEUR"}, status=status.HTTP_403_FORBIDDEN)
         id_acquisition = request.data.get('id_acquisition')  # Lu depuis Postman
         action = request.data.get('action')
         
@@ -1859,7 +1868,7 @@ class DirecteurDashboardView(APIView):
                 return token.get('role') == 'DIRECTEUR'
         except Exception:
             pass
-        return True  # Sécurité souple pour vos tests Postman
+        return False
 
     # [ACTION : getIndicateurs(filtre?)]
     def get(self, request):
@@ -2038,7 +2047,7 @@ class AdminJournalAuditView(APIView):
                 return token.get('role') == 'ADMINISTRATEUR'
         except Exception:
             pass
-        return True # Sécurité souple pour vos tests immédiats sur Postman
+        return False
 
     # [ACTION 1 : getJournalAudit(filtres?)]
     def get(self, request):
